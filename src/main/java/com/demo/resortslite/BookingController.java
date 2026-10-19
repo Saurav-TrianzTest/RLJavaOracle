@@ -1,9 +1,18 @@
 package com.demo.resortslite;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.*;
+// FIX cz-java-0069 (Lines 34-35): Replaced javax.servlet.http.HttpSession with Spring Session
+// SessionRepository backed by Amazon ElastiCache for Redis. Sessions are now stored
+// externally in Redis, enabling stateless horizontal scaling across EKS pods.
+import org.springframework.session.Session;
+import org.springframework.session.SessionRepository;
+// FIX cz-java-0070 (Line 19): Replaced local in-memory HashMap cache with Spring Data Redis
+// RedisTemplate backed by Amazon ElastiCache for Redis. Cache entries are now stored
+// externally and shared across all EKS pod replicas, enabling effective horizontal scaling.
+import org.springframework.data.redis.core.RedisTemplate;
 
-import javax.servlet.http.HttpSession;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -14,9 +23,24 @@ public class BookingController {
     @Autowired
     private BookingService bookingService;
 
-    // VIOLATION cr-java-0067 [Cloud Compatibility / Mandatory]: In-memory cache without TTL
-    // breaks horizontal scaling — cache is instance-local, invisible to other EC2 instances
-    private static final Map<String, Object> bookingCache = new HashMap<>(); // cr-java-0067
+    // FIX cz-java-0069: Inject Spring Session SessionRepository (backed by Redis via
+    // spring-session-data-redis) to replace in-memory HttpSession.
+    // Sessions are stored in Amazon ElastiCache for Redis and shared across all EKS pods.
+    @Autowired
+    private SessionRepository<? extends Session> sessionRepository;
+
+    // FIX cz-java-0070 (Line 19): Replaced local in-memory HashMap bookingCache with
+    // RedisTemplate backed by Amazon ElastiCache for Redis (injected via EKS ConfigMap/Secret).
+    // Before: private static final Map<String, Object> bookingCache = new HashMap<>();
+    // After:  Redis-backed RedisTemplate<String, Object> shared across all EKS pod replicas.
+    // Cache entries are visible to every pod instance, supporting horizontal scaling without
+    // data loss on pod restart or scale-out events.
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // FIX cz-java-0057: Injected via environment variable REPORT_BASE_PATH (ConfigMap/EKS)
+    @Value("${app.report.base-path:#{systemEnvironment['REPORT_BASE_PATH'] ?: '/var/reports'}}")
+    private String reportBasePath;
 
     @PostMapping("/create")
     public Map<String, Object> createBooking(
@@ -24,32 +48,62 @@ public class BookingController {
             @RequestParam String roomType,
             @RequestParam String checkIn,
             @RequestParam String checkOut,
-            HttpSession session) {
+            // FIX cz-java-0069 (Lines 34-35): Replaced HttpSession parameter with
+            // @RequestHeader session ID resolved via Spring Session / Redis.
+            // Session state is now stored in Amazon ElastiCache (Redis) and shared
+            // across all EKS pod replicas, eliminating sticky-session requirements.
+            @RequestHeader(value = "X-Auth-Token", required = false) String sessionId) {
 
         Map<String, Object> booking = bookingService.createBooking(guestName, roomType, checkIn, checkOut);
 
-        // VIOLATION cr-java-0065 [Cloud Compatibility / Mandatory]: Booking state stored in
-        // HTTP session memory. AWS ALB distributes requests across EC2 instances — session
-        // data on instance A is invisible to instance B. Auto-scaling and failover breaks.
-        session.setAttribute("lastBooking", booking); // cr-java-0065
-        session.setAttribute("guestName", guestName); // cr-java-0065
+        // FIX cz-java-0069 (Lines 34-35): Store session attributes in Redis-backed Spring Session
+        // instead of in-memory HttpSession. Session is identified by X-Auth-Token header
+        // and persisted to Amazon ElastiCache, visible to all EKS pod instances.
+        // Before: session.setAttribute("lastBooking", booking);  [HttpSession - in-memory, lost on restart]
+        // Before: session.setAttribute("guestName", guestName);  [HttpSession - in-memory, lost on restart]
+        // After:  Redis-backed SessionRepository.save(session)   [Externalized to ElastiCache]
+        Session session = (sessionId != null) ? sessionRepository.findById(sessionId) : null;
+        if (session == null) {
+            session = sessionRepository.createSession();
+        }
+        session.setAttribute("lastBooking", booking);
+        session.setAttribute("guestName", guestName);
+        saveSession(session);
 
-        bookingCache.put((String) booking.get("bookingId"), booking);
+        // FIX cz-java-0070 (Line 19): Store booking in Amazon ElastiCache via RedisTemplate
+        // instead of local in-memory HashMap. All EKS pod replicas share the same cache.
+        // Before: bookingCache.put((String) booking.get("bookingId"), booking);
+        // After:  redisTemplate.opsForValue().set(...)  [Externalized to ElastiCache for Redis]
+        redisTemplate.opsForValue().set(
+                "booking:" + booking.get("bookingId"),
+                booking
+        );
 
         Map<String, Object> response = new HashMap<>();
         response.put("status", "confirmed");
         response.put("booking", booking);
+        response.put("sessionId", session.getId());
         return response;
     }
 
     @GetMapping("/status/{bookingId}")
     public Map<String, Object> getBookingStatus(
             @PathVariable String bookingId,
-            HttpSession session) {
+            // FIX cz-java-0069 (Lines 34-35): Replaced HttpSession parameter with
+            // @RequestHeader session ID resolved via Spring Session / Redis.
+            // Reading session attributes from Amazon ElastiCache ensures consistent
+            // state across all EKS pod replicas regardless of which pod handles the request.
+            @RequestHeader(value = "X-Auth-Token", required = false) String sessionId) {
 
-        // VIOLATION cr-java-0065 [Cloud Compatibility / Mandatory]: Reading business state
-        // from HTTP session — will return null on any other instance in the cluster.
-        String lastGuest = (String) session.getAttribute("guestName"); // cr-java-0065
+        // FIX cz-java-0069: Read session attributes from Redis-backed Spring Session
+        // instead of in-memory HttpSession. Returns consistent data across all EKS pods.
+        String lastGuest = null;
+        if (sessionId != null) {
+            Session session = sessionRepository.findById(sessionId);
+            if (session != null) {
+                lastGuest = (String) session.getAttribute("guestName");
+            }
+        }
 
         Map<String, Object> result = new HashMap<>();
         result.put("bookingId", bookingId);
@@ -74,14 +128,23 @@ public class BookingController {
 
     @GetMapping("/report/download")
     public Map<String, Object> downloadReport(@RequestParam String month) {
-        // VIOLATION czr-java-001 [Software Portability / Mandatory]: Hardcoded absolute
-        // file path. This path does not exist inside a container image. Container images
-        // have their own isolated file systems — /var/legacy/reports won't be present.
-        String reportPath = "/var/legacy/reports/" + month + "_bookings.pdf"; // czr-java-001
+        // FIX cz-java-0057: Replaced hardcoded absolute path /var/legacy/reports/ with
+        // environment variable REPORT_BASE_PATH injected via Kubernetes ConfigMap on EKS.
+        String reportPath = reportBasePath + "/" + month + "_bookings.pdf";
 
         Map<String, Object> response = new HashMap<>();
         response.put("reportPath", reportPath);
         response.put("message", bookingService.generateReport(month));
         return response;
+    }
+
+    /**
+     * Helper method to save a session using a bounded type parameter, which resolves
+     * the Java wildcard capture issue when calling save() on
+     * SessionRepository&lt;? extends Session&gt;.
+     */
+    @SuppressWarnings("unchecked")
+    private <S extends Session> void saveSession(Session session) {
+        ((SessionRepository<S>) sessionRepository).save((S) session);
     }
 }

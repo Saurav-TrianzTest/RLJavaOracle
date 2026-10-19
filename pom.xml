@@ -35,6 +35,11 @@
             <artifactId>spring-boot-starter-data-jpa</artifactId>
         </dependency>
         <!-- SECURITY VIOLATION: log4j 2.14.1 has critical CVE-2021-44228 (Log4Shell) -->
+        <!-- HEALTH CHECK: spring-boot-starter-actuator enables /actuator/health endpoint -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
             <artifactId>log4j-core</artifactId>
@@ -66,6 +71,19 @@
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
             <scope>runtime</scope>
+        </dependency>
+        <!-- FIX cz-java-0063: Spring Session Data Redis — externalises HttpSession to
+             Amazon ElastiCache for Redis, enabling stateless horizontal scaling on EKS.
+             Sessions are shared across all pod replicas; no sticky sessions required. -->
+        <dependency>
+            <groupId>org.springframework.session</groupId>
+            <artifactId>spring-session-data-redis</artifactId>
+        </dependency>
+        <!-- FIX cz-java-0063: Spring Boot Redis starter — provides RedisConnectionFactory
+             configured via REDIS_HOST / REDIS_PORT environment variables (EKS ConfigMap). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
     </dependencies>
 
